@@ -4,13 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
+	"github.com/docker/libkv/store/dynamo/streams"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var (
@@ -25,6 +28,113 @@ var (
 type DynamoDB struct {
 	tableName string
 	client    *dynamodb.DynamoDB
+	watcher   *Watcher
+}
+
+//watched tracks a particular key or directory
+type WatchClient struct {
+	prefix string
+	feedCh chan *store.KVPair
+}
+
+func (wc *WatchClient) Notify(pair *store.KVPair) {
+	wc.feedCh <- pair
+}
+
+func (wc *WatchClient) IsMatch(s string) bool {
+	return strings.Contains(s, wc.prefix)
+}
+
+//watcher helps consolidate all the
+type Watcher struct {
+	sync.RWMutex
+	clients map[<-chan struct{}]*WatchClient
+}
+
+func (w *Watcher) Monitor(stopCh <-chan struct{}) {
+	select {
+	case <-stopCh:
+		w.RemoveClient(stopCh)
+	}
+}
+
+//Adds a watcher taking in a stopCh and returns a channel
+func (w *Watcher) AddClient(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error ){
+	wch := &WatchClient{key, make(chan *store.KVPair, 100)}
+	w.Lock()
+	defer w.Unlock()
+	w.clients[stopCh] = wch
+	go w.Monitor(stopCh)
+	return wch.feedCh, nil
+}
+
+func (w *Watcher) RemoveClient(stopCh <-chan struct{}) {
+	w.Lock()
+	defer w.Unlock()
+	//close the channel
+	if client, ok := w.clients[stopCh]; ok {
+		delete(w.clients, stopCh)
+		//close the feed channel
+		close(client.feedCh)
+	}
+}
+
+func NewWatcher(table string) *Watcher {
+	w := &Watcher{clients: make(map[<-chan struct{}]*WatchClient)}
+	go w.WatcherLoop(table)
+	return w
+}
+
+//who triggers watching?
+func (w *Watcher) WatcherLoop(table string) {
+	
+	for {
+
+		// if len(w.clients) == 0 {
+		// 	continue
+		// }
+
+		//setup the notifyloop
+		sink := make(chan *store.KVPair, 10000)
+		stopCh := make(chan struct {})
+		go w.notifyLoop(sink, stopCh)
+
+
+		//set up the stream client
+		client, err := streams.NewDynamoDBStreamClient(table)
+		//todo handle error with backoff
+		if err != nil {
+			return
+		}
+		var  input <-chan *dynamodbstreams.Record = client.Watch() 
+		for {
+			select {
+			case rec := <- input:
+				//todo: synthesize an event
+				fmt.Printf("record(%+v)", rec)
+				sink <- &store.KVPair{Key: "a", Value: []byte("b")}
+			}
+		}
+
+	}
+}
+
+func (w *Watcher) notifyLoop(input <-chan *store.KVPair, stopCh <-chan struct {}) {
+	var pair *store.KVPair
+	for {
+		select {
+		case pair = <-input:
+			w.Lock()
+			for _, v := range w.clients {
+				if v.IsMatch(pair.Key) {
+					v.Notify(pair)
+				}
+			}
+			w.Unlock()
+		case <- stopCh :
+			break;
+		}
+	}
 }
 
 // Register registers dynamodb to libkv
@@ -32,37 +142,42 @@ func Register() {
 	libkv.AddStore(store.DYNAMODB, New)
 }
 
-// New create a new connection to dynamodb then table named endpoint
+func getSession() (*session.Session, error) {
+	sess, err := session.NewSession()
+
+	if dynamodbURL := os.Getenv("DYNAMODB_LOCAL"); dynamodbURL != "" {
+		fmt.Println("DYNAMODB_LOCAL is set to %v", dynamodbURL)
+		c := &aws.Config{
+			Endpoint: &dynamodbURL,
+		}
+		//Create a Session with a custom region
+		sess, err = session.NewSession(c)
+	}
+
+	// Fail early, if no credentials can be found
+	_, err = sess.Config.Credentials.Get()
+	return sess, err
+}
+
+//this works
 func New(endpoints []string, options *store.Config) (store.Store, error) {
+	fmt.Printf("\nendpoints : %+v, options : %+v\n", endpoints, options)
+
 	if len(endpoints) > 1 {
 		return nil, ErrMultipleEndpointsUnsupported
 	}
 
-	// treate the bucket as the AWS region
-	// default to us-east-1
-	region := "us-east-1"
-	if options.Bucket != "" {
-		region = options.Bucket
-	}
+	fmt.Printf("Dynaodb table name %v\n", endpoints[0])
 
-	var sess *session.Session
-	var creds *credentials.Credentials
-
-	// If creds are provided use those
-	// Treate Username as AWS_ACCESS_KEY_ID and Password as AWS_SECRET_ACCESSK_EY
-	if options.Username != "" && options.Password != "" {
-		creds = credentials.NewStaticCredentials(options.Username, options.Password, "")
-		sess, _ = session.NewSession(&aws.Config{
-			Region:      aws.String(region),
-			Credentials: creds,
-		})
-	} else {
-		sess, _ = session.NewSession(&aws.Config{Region: aws.String(region)})
+	sess, err := getSession()
+	if err != nil {
+		return nil, err
 	}
 
 	dyna := &DynamoDB{
 		tableName: endpoints[0],
 		client:    dynamodb.New(sess),
+		watcher:   NewWatcher(endpoints[0]),
 	}
 	return dyna, nil
 }
@@ -131,7 +246,9 @@ func (d *DynamoDB) getPutParams(key string, value []byte) *dynamodb.UpdateItemIn
 
 // Puts the 'key':'value' in the db
 func (d *DynamoDB) Put(key string, value []byte, opts *store.WriteOptions) error {
+
 	params := d.getPutParams(key, value)
+	fmt.Printf("Dynamodb.Put : %+v", params)
 	_, err := d.client.UpdateItem(params)
 	return err
 }
@@ -230,7 +347,7 @@ func (d *DynamoDB) DeleteTree(directory string) error {
 func (d *DynamoDB) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error) {
 	// since scans are expensive maybe we should keep all keys being watched in a map
 	// and consolidate our scans of the db into one scan
-	return nil, errors.New("Watch not supported")
+	return d.watcher.AddClient(key, stopCh)
 }
 
 // WatchTree has to be implemented at the library since it is not natively supportedby dynamoDB

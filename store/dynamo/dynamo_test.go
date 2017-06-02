@@ -6,6 +6,10 @@ import (
 	"github.com/docker/libkv/testutils"
 	"github.com/stretchr/testify/assert"
 	"testing"
+	//"time"
+	//"fmt"
+	"log"
+	"time"
 )
 
 var client = "traefik"
@@ -36,9 +40,25 @@ func TestRegister(t *testing.T) {
 	}
 }
 
+func _TestStream(kv store.Store, t *testing.T)  {
+	stopch := make(chan struct {})
+	ch, _ := kv.Watch("testPutGetDeleteExists", stopch)
+	for {
+		select {
+			case a:= <-ch :
+				log.Printf("TestStream(next) %v",a)
+			case <-time.After(time.Second*10):
+				stopch <- struct{}{}
+				goto done
+		}
+	}
+	done:
+		log.Printf("done testing")
+}
+
 func TestDynamoDBStore(t *testing.T) {
 	kv := makeDynamoClient(t)
-	testutils.RunTestCommon(t, kv)
+	//_TestStream(kv, t)
 	testutils.RunTestAtomic(t, kv)
 	testutils.RunCleanup(t, kv)
 }
