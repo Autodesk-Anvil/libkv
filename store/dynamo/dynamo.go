@@ -3,18 +3,20 @@ package dynamo
 import (
 	"errors"
 	"fmt"
+	"github.com/autodesk-anvil/libkv/store/dynamo/streams"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
-	"github.com/docker/libkv/store/dynamo/streams"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 )
+
+const DYNAMODBSTORE store.Backend = "dynamodb"
 
 var (
 	// ErrMultipleEndpointsUnsupported is thrown when there are
@@ -59,7 +61,7 @@ func (w *Watcher) Monitor(stopCh <-chan struct{}) {
 }
 
 //Adds a watcher taking in a stopCh and returns a channel
-func (w *Watcher) AddClient(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error ){
+func (w *Watcher) AddClient(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error) {
 	wch := &WatchClient{key, make(chan *store.KVPair, 100)}
 	w.Lock()
 	defer w.Unlock()
@@ -87,7 +89,7 @@ func NewWatcher(table string) *Watcher {
 
 //who triggers watching?
 func (w *Watcher) WatcherLoop(table string) {
-	
+
 	for {
 
 		// if len(w.clients) == 0 {
@@ -96,9 +98,8 @@ func (w *Watcher) WatcherLoop(table string) {
 
 		//setup the notifyloop
 		sink := make(chan *store.KVPair, 10000)
-		stopCh := make(chan struct {})
+		stopCh := make(chan struct{})
 		go w.notifyLoop(sink, stopCh)
-
 
 		//set up the stream client
 		client, err := streams.NewDynamoDBStreamClient(table)
@@ -106,10 +107,10 @@ func (w *Watcher) WatcherLoop(table string) {
 		if err != nil {
 			return
 		}
-		var  input <-chan *dynamodbstreams.Record = client.Watch() 
+		var input <-chan *dynamodbstreams.Record = client.Watch()
 		for {
 			select {
-			case rec := <- input:
+			case rec := <-input:
 				//todo: synthesize an event
 				fmt.Printf("record(%+v)", rec)
 				sink <- &store.KVPair{Key: "a", Value: []byte("b")}
@@ -119,7 +120,7 @@ func (w *Watcher) WatcherLoop(table string) {
 	}
 }
 
-func (w *Watcher) notifyLoop(input <-chan *store.KVPair, stopCh <-chan struct {}) {
+func (w *Watcher) notifyLoop(input <-chan *store.KVPair, stopCh <-chan struct{}) {
 	var pair *store.KVPair
 	for {
 		select {
@@ -131,15 +132,15 @@ func (w *Watcher) notifyLoop(input <-chan *store.KVPair, stopCh <-chan struct {}
 				}
 			}
 			w.Unlock()
-		case <- stopCh :
-			break;
+		case <-stopCh:
+			break
 		}
 	}
 }
 
 // Register registers dynamodb to libkv
 func Register() {
-	libkv.AddStore(store.DYNAMODB, New)
+	libkv.AddStore(DYNAMODBSTORE, New)
 }
 
 func getSession() (*session.Session, error) {

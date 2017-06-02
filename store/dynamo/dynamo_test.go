@@ -31,7 +31,7 @@ func makeDynamoClient(t *testing.T) store.Store {
 
 func TestRegister(t *testing.T) {
 	Register()
-	kv, err := libkv.NewStore(store.DYNAMODB, []string{client}, &store.Config{})
+	kv, err := libkv.NewStore(DYNAMODBSTORE, []string{client}, &store.Config{})
 	assert.NoError(t, err)
 	assert.NotNil(t, kv)
 
@@ -40,20 +40,20 @@ func TestRegister(t *testing.T) {
 	}
 }
 
-func _TestStream(kv store.Store, t *testing.T)  {
-	stopch := make(chan struct {})
+func _TestStream(kv store.Store, t *testing.T) {
+	stopch := make(chan struct{})
 	ch, _ := kv.Watch("testPutGetDeleteExists", stopch)
 	for {
 		select {
-			case a:= <-ch :
-				log.Printf("TestStream(next) %v",a)
-			case <-time.After(time.Second*10):
-				stopch <- struct{}{}
-				goto done
+		case a := <-ch:
+			log.Printf("TestStream(next) %v", a)
+		case <-time.After(time.Second * 10):
+			stopch <- struct{}{}
+			goto done
 		}
 	}
-	done:
-		log.Printf("done testing")
+done:
+	log.Printf("done testing")
 }
 
 func TestDynamoDBStore(t *testing.T) {
