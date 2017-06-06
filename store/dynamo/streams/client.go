@@ -3,178 +3,198 @@ package streams
 import (
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
 	"log"
-	"os"
+	"errors"
+	"math/big"
+
 )
+/*
+	It is recommended that we do not have more than a couple streamsclient.
+*/
 
-var RestDBClient *Client
-var StreamDBClient *StreamClient
-var Tablename string = "traefik"
-// var client *dynamodb.Client
-
+var (
+	// ErrMultipleEndpointsUnsupported is thrown when there are
+	// multiple endpoints specified for Dynamodb
+	ErrNoStreamFound = errors.New("No streams found")
+)
 
 // Client is a wrapper around the DynamoDB client
 // and also holds the table to lookup key value pairs from
-type Client struct {
-	client *dynamodb.DynamoDB
-	table  string
+type StreamClient struct {
+	client 			*dynamodbstreams.DynamoDBStreams
+	table  			string
+	streams 		[]string
+	Ch 				chan *dynamodbstreams.Record
+	sequenceNumber 	*big.Int
 }
 
-func getSession() (*session.Session, error) {
-	sess, err := session.NewSession()
-
-	if dynamodbURL := os.Getenv("DYNAMODB_LOCAL"); dynamodbURL != "" {
-		fmt.Println("DYNAMODB_LOCAL is set to %v", dynamodbURL)
-		c := &aws.Config{
-			Endpoint: &dynamodbURL,
-		}
-		//Create a Session with a custom region
-		sess, err = session.NewSession(c)
-	} 
-
-	// Fail early, if no credentials can be found
-	_, err = sess.Config.Credentials.Get()
-	return sess, err
+func toBigInt(s *string) (*big.Int, error) {
+	if s == nil {
+		return nil, fmt.Errorf("Invalid number")
+	}
+	var i = new(big.Int)
+	_, err := fmt.Sscan(*s, i)
+	return i, err
 }
 
-// NewDynamoDBClient returns an *dynamodb.Client with a connection to the region
+// NewDynamoDBStreamClient returns an *dynamodb.Client with a connection to the region
 // configured via the AWS_REGION environment variable.
 // It returns an error if the connection cannot be made or the table does not exist.
-func NewDynamoDBClient(table string) (*Client, error) {
-	
-	// Create Session
+func NewDynamoDBStreamClient(table string, sequenceNumber string, done <-chan struct {}) (*StreamClient, error) {
+
+	//create a dynamodb client
 	sess, err := getSession()
 	if err != nil {
 		return nil, err
 	}
-	d := dynamodb.New(sess)
 
-	// Check if the table exists
-	_, err = d.DescribeTable(&dynamodb.DescribeTableInput{TableName: &table})
+	// Fail early, if no credentials can be found
+	_, err = sess.Config.Credentials.Get()
 	if err != nil {
 		return nil, err
 	}
-	return &Client{d, table}, nil
+
+	client := dynamodbstreams.New(sess)
+
+
+	//Select streams
+	streams, err := selectStreams(client, table)
+	if err != nil || len(streams) < 1 {
+		return nil, ErrNoStreamFound
+	}
+
+	sn, err := toBigInt(&sequenceNumber)
+	if err != nil {
+		log.Printf("bad sequence number(%v) error %v", sequenceNumber, err)
+		return nil, err
+	}
+
+	c := &StreamClient{client, table, streams, make(chan *dynamodbstreams.Record, 100000), sn}
+	
+	//start pulling from the stream
+	c.processStreams(done)
+	return c, nil
 }
 
-func (c *Client) GetTables() error {
+func selectStreams(client *dynamodbstreams.DynamoDBStreams, table string) ([]string, error){
 
-	op, err := c.client.ListTables(&dynamodb.ListTablesInput{})
+	params := &dynamodbstreams.ListStreamsInput{
+		TableName: aws.String(table),
+	}
+	resp, err := client.ListStreams(params)
+
+	if err != nil || len(resp.Streams) == 0 {
+		return nil, fmt.Errorf("streams not found")
+	}
+	streams := make([]string, 0)
+	for _, v := range resp.Streams {
+		streams = append(streams, *v.StreamArn)
+	}
+	return streams, nil
+}
+
+func (c *StreamClient) processStreams(done <-chan struct{}) {
+	for _, stream := range c.streams {
+		c.processStream(stream, done)
+	}
+}
+
+//set up pipeline that can be cancelled
+func (c *StreamClient) processStream(stream string, done <-chan struct{}) {
+
+	describeStreamInput := &dynamodbstreams.DescribeStreamInput{
+		StreamArn: aws.String(stream), // Required
+	}
+	describeStreamInputResp, err := c.client.DescribeStream(describeStreamInput)
+
 	if err != nil {
-		return err
+		fmt.Println(err.Error())
+		return
 	} else {
-		fmt.Printf("tables : %+v", op)
+		//log.Printf("describeStreamInputResp: %+v", describeStreamInputResp)
 	}
-	return nil
+
+	//get shards //todo(do we need to keep scanning for shards?)
+	var shards []*dynamodbstreams.Shard = describeStreamInputResp.StreamDescription.Shards
+	
+	for _, shard := range shards {
+		go c.processShard(shard, stream, done)
+	}
+	go func(){
+		select{
+			case <-done:
+				log.Println("\nclosing c.Ch")
+				close(c.Ch)
+		}
+	}()
 }
 
-func (c *Client) Scan() {
-	params := &dynamodb.ScanInput{
-		TableName: aws.String(c.table), // Required
-		AttributesToGet: []*string{
-			aws.String("Artist"),     // Required
-			aws.String("SongTitle"),  // Required
-			aws.String("AlbumTitle"), // Required
-			// More values...
-		},
+func (c *StreamClient) processShard(shard *dynamodbstreams.Shard, stream string, done <-chan struct{}) {
+	shardName := *shard.ShardId
+	if len(shardName) > 10 {
+		shardName = shardName[len(shardName)-3:]
 	}
-	resp, err := c.client.Scan(params)
+	//log.Printf("processing shard %v\n", shardName)
 
+	maxSequenceNumber, err2 := toBigInt(shard.SequenceNumberRange.EndingSequenceNumber)
+	if err2 == nil {
+		//x > y
+		if c.sequenceNumber.Cmp(maxSequenceNumber) == 1 {
+			//these events are too old
+			return
+		}
+	}
+
+	getShardIteratorInput := &dynamodbstreams.GetShardIteratorInput{
+		ShardId:           	aws.String(*shard.ShardId),                      // Required
+		ShardIteratorType: 	aws.String(dynamodbstreams.ShardIteratorTypeAtSequenceNumber), //aws.String(dynamodbstreams.ShardIteratorTypeAfterSequenceNumber), // Required
+		SequenceNumber: 	shard.SequenceNumberRange.StartingSequenceNumber,
+		StreamArn: 			aws.String(stream), // Required
+	}
+	//log.Printf("GetShardIterator(%+v)", getShardIteratorInput)
+	getShardIteratorInputResp, err := c.client.GetShardIterator(getShardIteratorInput)		
 	if err != nil {
 		// Print the error, cast err to awserr.Error to get the Code and
 		// Message from an error.
-		fmt.Println(err.Error())
+		//fmt.Printf("\nerror processing(%v): err: %v\n", shardName, err.Error())
 		return
 	}
+	iter := getShardIteratorInputResp.ShardIterator
 
-	// Pretty-print the response data.
-	fmt.Println(resp)
-}
-
-func (c *Client) Query() {
-	ss := "Acme Band"
-	var params = &dynamodb.QueryInput{
-		TableName: aws.String(c.table),
-		KeyConditions: map[string]*dynamodb.Condition{
-			"Artist": {
-				ComparisonOperator: aws.String("EQ"),
-				AttributeValueList: []*dynamodb.AttributeValue{
-					{
-						S: &ss,
-					},
-				},
-			},
-		},
+	for iter != nil {
+		
+		//get records
+		getRecordsInput := &dynamodbstreams.GetRecordsInput{
+			ShardIterator: aws.String(*iter), // Required
+		}
+		getRecordsInputResp, err := c.client.GetRecords(getRecordsInput)
+		if err != nil {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+			break
+		}
+	
+		for _, v := range getRecordsInputResp.Records {
+			//the record sequence number sn is not less than c.sequenceNumber 
+			sn, err := toBigInt(v.Dynamodb.SequenceNumber)
+			if err == nil && sn.Cmp(c.sequenceNumber) != -1 {
+				//log.Printf("dynamodbstreams event(%v)", v)
+				c.Ch <- v
+			} else {
+				//log.Printf("rejecting event:sequence number %v out of range", *v.Dynamodb.SequenceNumber)
+			}
+		}
+		
+		select {
+		case <- done:
+			fmt.Printf("\nprocessShard(%v) canceled \n", shardName)
+			return
+		default:
+		}
+		iter = getRecordsInputResp.NextShardIterator
 	}
-
-	resp, err := c.client.Query(params)
-
-	if err != nil {
-		// Print the error, cast err to awserr.Error to get the Code and
-		// Message from an error.
-		fmt.Println(err.Error())
-		return
-	}
-
-	// Pretty-print the response data.
-	fmt.Printf("Query resp: %v", resp)
-}
-
-// func (c *Client) Update() error {
-// 	ss := "Acme Band"
-// 	params := &dynamodb.UpdateItemInput{
-//     	Key: map[string]*dynamodb.AttributeValue{ // Required
-//         	"Key": { // Required
-// 	            S:    aws.String("StringAttributeValue"),
-//             },
-//         },
-//     	TableName: aws.String("Music"), // Required
-//     	AttributeUpdates: map[string]*dynamodb.AttributeValueUpdate{
-//         "Key": { // Required
-//             Action: aws.String("PUT"),
-//             Value: &dynamodb.AttributeValue{
-//                 S:    aws.String("StringAttributeValue"),
-//             },
-//         },
-//         // More values...
-//     },
-//     },
-// }
-
-// 	resp, err := c.client.Query(params)
-
-// 	if err != nil {
-// 		// Print the error, cast err to awserr.Error to get the Code and
-// 		// Message from an error.
-// 		fmt.Println(err.Error())
-// 		return nil
-// 	}
-
-// 	// Pretty-print the response data.
-// 	fmt.Printf("Query resp: %v", resp)
-// 	return nil
-// }
-
-// WatchPrefix is not implemented
-func (c *Client) WatchPrefix(prefix string, keys []string, waitIndex uint64, stopChan chan bool) (uint64, error) {
-	<-stopChan
-	return 0, nil
-}
-
-func init() {
-	var err error
-	RestDBClient, err = NewDynamoDBClient(Tablename)
-	if err != nil {
-		log.Printf("error creating client: %v", err)
-		panic("could not create client")
-	}
-	StreamDBClient, err = NewDynamoDBStreamClient(Tablename)
-	if err != nil {
-		log.Printf("error creating StreamClient: %v", err)
-		panic("could not create client")
-	}
-
+	//log.Printf("done processing shardId %v", shardName)
 }
 

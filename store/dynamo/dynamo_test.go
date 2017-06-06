@@ -3,11 +3,9 @@ package dynamo
 import (
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
-	"github.com/docker/libkv/testutils"
+	//"github.com/docker/libkv/testutils"
 	"github.com/stretchr/testify/assert"
 	"testing"
-	//"time"
-	//"fmt"
 	"log"
 	"time"
 )
@@ -56,9 +54,53 @@ done:
 	log.Printf("done testing")
 }
 
-func TestDynamoDBStore(t *testing.T) {
+func TestWatchTree(t *testing.T) {
 	kv := makeDynamoClient(t)
 	//_TestStream(kv, t)
-	testutils.RunTestAtomic(t, kv)
-	testutils.RunCleanup(t, kv)
+	//testutils.RunTestAtomic(t, kv)
+	//testutils.RunCleanup(t, kv)
+	done := make(chan struct{},1)
+	//key := "testAtomicPut"
+	key := ""
+	ch, err := kv.WatchTree(key, done)
+	if err != nil {
+		t.Fatalf("streams failed %v", err)
+	}
+	go func(){
+		select {
+		case a := <-ch:
+			log.Printf("TestDynamoDBStore=>key:%v, value:%v\n", a[0].Key, string(a[0].Value))
+		case <-done:
+			log.Println("TestDynamoDBStore.done")
+			return 
+		}
+	}()
+	<- time.After(time.Second*15)
+	close(done)
+	<-time.After(time.Second)
+}
+func TestWatch(t *testing.T) {
+	kv := makeDynamoClient(t)
+	//_TestStream(kv, t)
+	//testutils.RunTestAtomic(t, kv)
+	//testutils.RunCleanup(t, kv)
+	done := make(chan struct{},1)
+	//key := "testAtomicPut"
+	key := ""
+	ch, err := kv.Watch(key, done)
+	if err != nil {
+		t.Fatalf("streams failed %v", err)
+	}
+	go func(){
+		select {
+		case a := <-ch:
+			log.Printf("TestDynamoDBStore=>key:%v, value:%v\n", a.Key, string(a.Value))
+		case <-done:
+			log.Println("TestDynamoDBStore.done")
+			return 
+		}
+	}()
+	<- time.After(time.Second*15)
+	close(done)
+	<-time.After(time.Second)
 }

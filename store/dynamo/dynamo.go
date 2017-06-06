@@ -3,17 +3,14 @@ package dynamo
 import (
 	"errors"
 	"fmt"
-	"github.com/autodesk-anvil/libkv/store/dynamo/streams"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
+		"github.com/aws/aws-sdk-go/service/dynamodb"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 const DYNAMODBSTORE store.Backend = "dynamodb"
@@ -31,111 +28,7 @@ type DynamoDB struct {
 	tableName string
 	client    *dynamodb.DynamoDB
 	watcher   *Watcher
-}
-
-//watched tracks a particular key or directory
-type WatchClient struct {
-	prefix string
-	feedCh chan *store.KVPair
-}
-
-func (wc *WatchClient) Notify(pair *store.KVPair) {
-	wc.feedCh <- pair
-}
-
-func (wc *WatchClient) IsMatch(s string) bool {
-	return strings.Contains(s, wc.prefix)
-}
-
-//watcher helps consolidate all the
-type Watcher struct {
-	sync.RWMutex
-	clients map[<-chan struct{}]*WatchClient
-}
-
-func (w *Watcher) Monitor(stopCh <-chan struct{}) {
-	select {
-	case <-stopCh:
-		w.RemoveClient(stopCh)
-	}
-}
-
-//Adds a watcher taking in a stopCh and returns a channel
-func (w *Watcher) AddClient(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error) {
-	wch := &WatchClient{key, make(chan *store.KVPair, 100)}
-	w.Lock()
-	defer w.Unlock()
-	w.clients[stopCh] = wch
-	go w.Monitor(stopCh)
-	return wch.feedCh, nil
-}
-
-func (w *Watcher) RemoveClient(stopCh <-chan struct{}) {
-	w.Lock()
-	defer w.Unlock()
-	//close the channel
-	if client, ok := w.clients[stopCh]; ok {
-		delete(w.clients, stopCh)
-		//close the feed channel
-		close(client.feedCh)
-	}
-}
-
-func NewWatcher(table string) *Watcher {
-	w := &Watcher{clients: make(map[<-chan struct{}]*WatchClient)}
-	go w.WatcherLoop(table)
-	return w
-}
-
-//who triggers watching?
-func (w *Watcher) WatcherLoop(table string) {
-
-	for {
-
-		// if len(w.clients) == 0 {
-		// 	continue
-		// }
-
-		//setup the notifyloop
-		sink := make(chan *store.KVPair, 10000)
-		stopCh := make(chan struct{})
-		go w.notifyLoop(sink, stopCh)
-
-		//set up the stream client
-		client, err := streams.NewDynamoDBStreamClient(table)
-		//todo handle error with backoff
-		if err != nil {
-			return
-		}
-		var input <-chan *dynamodbstreams.Record = client.Watch()
-		for {
-			select {
-			case rec := <-input:
-				//todo: synthesize an event
-				fmt.Printf("record(%+v)", rec)
-				sink <- &store.KVPair{Key: "a", Value: []byte("b")}
-			}
-		}
-
-	}
-}
-
-func (w *Watcher) notifyLoop(input <-chan *store.KVPair, stopCh <-chan struct{}) {
-	var pair *store.KVPair
-	for {
-		select {
-		case pair = <-input:
-			w.Lock()
-			for _, v := range w.clients {
-				if v.IsMatch(pair.Key) {
-					v.Notify(pair)
-				}
-			}
-			w.Unlock()
-		case <-stopCh:
-			break
-		}
-	}
+	done 	  chan struct{}
 }
 
 // Register registers dynamodb to libkv
@@ -143,6 +36,7 @@ func Register() {
 	libkv.AddStore(DYNAMODBSTORE, New)
 }
 
+//todo: fix getsession: move to common location for streams to use.
 func getSession() (*session.Session, error) {
 	sess, err := session.NewSession()
 
@@ -162,23 +56,31 @@ func getSession() (*session.Session, error) {
 
 //this works
 func New(endpoints []string, options *store.Config) (store.Store, error) {
-	fmt.Printf("\nendpoints : %+v, options : %+v\n", endpoints, options)
+	//fmt.Printf("\nendpoints : %+v, options : %+v\n", endpoints, options)
 
 	if len(endpoints) > 1 {
 		return nil, ErrMultipleEndpointsUnsupported
 	}
-
-	fmt.Printf("Dynaodb table name %v\n", endpoints[0])
+	table := endpoints[0]
+	
+	//fmt.Printf("Dynaodb table name %v\n", endpoints[0])
 
 	sess, err := getSession()
 	if err != nil {
 		return nil, err
 	}
 
+	done := make(chan struct{}, 1)
+	w, err := newWatcher(table, "0", done)
+		if err != nil {
+		return nil, err
+	}
+
 	dyna := &DynamoDB{
 		tableName: endpoints[0],
 		client:    dynamodb.New(sess),
-		watcher:   NewWatcher(endpoints[0]),
+		watcher:   w,
+		done : done,
 	}
 	return dyna, nil
 }
@@ -348,12 +250,27 @@ func (d *DynamoDB) DeleteTree(directory string) error {
 func (d *DynamoDB) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error) {
 	// since scans are expensive maybe we should keep all keys being watched in a map
 	// and consolidate our scans of the db into one scan
-	return d.watcher.AddClient(key, stopCh)
+	return d.watcher.addClient(key, stopCh, 0, false)
 }
 
 // WatchTree has to be implemented at the library since it is not natively supportedby dynamoDB
 func (d *DynamoDB) WatchTree(directory string, stopCh <-chan struct{}) (<-chan []*store.KVPair, error) {
-	return nil, errors.New("WatchTree not supported")
+	return d.WatchTreeEvents(directory, stopCh, 0)
+}
+
+func (d *DynamoDB) WatchTreeEvents(directory string, stopCh <-chan struct{}, lastIndex uint64) (<-chan []*store.KVPair, error) {
+	nn, err := d.watcher.addClient(directory, stopCh, lastIndex, true)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan []*store.KVPair, 1000)
+	go func(){
+		for n := range nn {
+            out <- []*store.KVPair{n}
+        }
+	}()
+	return out, err
 }
 
 // Not supported
