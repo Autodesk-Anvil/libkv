@@ -7,7 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
-		"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"os"
 	"strconv"
 	"strings"
