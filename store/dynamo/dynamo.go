@@ -3,9 +3,8 @@ package dynamo
 import (
 	"errors"
 	"fmt"
+	"github.com/autodesk-anvil/libkv/store/dynamo/session"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
@@ -38,26 +37,11 @@ func New(endpoints []string, options *store.Config) (store.Store, error) {
 		return nil, ErrMultipleEndpointsUnsupported
 	}
 
-	// treate the bucket as the AWS region
-	// default to us-east-1
-	region := "us-east-1"
-	if options.Bucket != "" {
-		region = options.Bucket
-	}
+	//fmt.Printf("Dynaodb table name %v\n", endpoints[0])
 
-	var sess *session.Session
-	var creds *credentials.Credentials
-
-	// If creds are provided use those
-	// Treate Username as AWS_ACCESS_KEY_ID and Password as AWS_SECRET_ACCESSK_EY
-	if options.Username != "" && options.Password != "" {
-		creds = credentials.NewStaticCredentials(options.Username, options.Password, "")
-		sess, _ = session.NewSession(&aws.Config{
-			Region:      aws.String(region),
-			Credentials: creds,
-		})
-	} else {
-		sess, _ = session.NewSession(&aws.Config{Region: aws.String(region)})
+	sess, err := session.Session()
+	if err != nil {
+		return nil, err
 	}
 
 	dyna := &DynamoDB{
