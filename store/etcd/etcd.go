@@ -604,3 +604,8 @@ func (l *etcdLock) Unlock() error {
 func (s *Etcd) Close() {
 	return
 }
+
+// Close closes the client connection
+func (s *Etcd) Client() etcd.KeysAPI {
+	return s.client
+}
