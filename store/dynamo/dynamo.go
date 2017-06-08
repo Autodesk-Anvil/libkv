@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+const DYNAMODBSTORE store.Backend = "dynamodb"
+
 var (
 	// ErrMultipleEndpointsUnsupported is thrown when there are
 	// multiple endpoints specified for Dynamodb
@@ -28,7 +30,7 @@ type DynamoDB struct {
 
 // Register registers dynamodb to libkv
 func Register() {
-	libkv.AddStore(store.DYNAMODB, New)
+	libkv.AddStore(DYNAMODBSTORE, New)
 }
 
 // New create a new connection to dynamodb then table named endpoint

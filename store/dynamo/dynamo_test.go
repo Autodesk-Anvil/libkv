@@ -27,7 +27,7 @@ func makeDynamoClient(t *testing.T) store.Store {
 
 func TestRegister(t *testing.T) {
 	Register()
-	kv, err := libkv.NewStore(store.DYNAMODB, []string{client}, &store.Config{})
+	kv, err := libkv.NewStore(DYNAMODBSTORE, []string{client}, &store.Config{})
 	assert.NoError(t, err)
 	assert.NotNil(t, kv)
 
