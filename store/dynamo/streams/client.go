@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
+	"github.com/autodesk-anvil/libkv/store/dynamo/session"
 	"log"
 	"errors"
 	"math/big"
@@ -44,7 +45,7 @@ func toBigInt(s *string) (*big.Int, error) {
 func NewDynamoDBStreamClient(table string, sequenceNumber string, done <-chan struct {}) (*StreamClient, error) {
 
 	//create a dynamodb client
-	sess, err := getSession()
+	sess, err := session.Session()
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +136,7 @@ func (c *StreamClient) processShard(shard *dynamodbstreams.Shard, stream string,
 	if len(shardName) > 10 {
 		shardName = shardName[len(shardName)-3:]
 	}
-	//log.Printf("processing shard %v\n", shardName)
+	//log.Printf("processShard start(%v)\n", shardName)
 
 	maxSequenceNumber, err2 := toBigInt(shard.SequenceNumberRange.EndingSequenceNumber)
 	if err2 == nil {
@@ -178,9 +179,10 @@ func (c *StreamClient) processShard(shard *dynamodbstreams.Shard, stream string,
 	
 		for _, v := range getRecordsInputResp.Records {
 			//the record sequence number sn is not less than c.sequenceNumber 
+			//log.Printf("processShard record(%v)", v)
 			sn, err := toBigInt(v.Dynamodb.SequenceNumber)
 			if err == nil && sn.Cmp(c.sequenceNumber) != -1 {
-				//log.Printf("dynamodbstreams event(%v)", v)
+				//log.Printf("processShard event(%v)", *v.Dynamodb.Keys["Key"].S)
 				c.Ch <- v
 			} else {
 				//log.Printf("rejecting event:sequence number %v out of range", *v.Dynamodb.SequenceNumber)
@@ -189,12 +191,12 @@ func (c *StreamClient) processShard(shard *dynamodbstreams.Shard, stream string,
 		
 		select {
 		case <- done:
-			fmt.Printf("\nprocessShard(%v) canceled \n", shardName)
+			fmt.Printf("\nprocessShard canceled(%v)\n", shardName)
 			return
 		default:
 		}
 		iter = getRecordsInputResp.NextShardIterator
 	}
-	//log.Printf("done processing shardId %v", shardName)
+	//log.Printf("processShard done(%v)\n", shardName)
 }
 

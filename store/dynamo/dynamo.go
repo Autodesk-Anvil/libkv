@@ -3,12 +3,11 @@ package dynamo
 import (
 	"errors"
 	"fmt"
+	"github.com/autodesk-anvil/libkv/store/dynamo/session"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"os"
 	"strconv"
 	"strings"
 )
@@ -28,30 +27,12 @@ type DynamoDB struct {
 	tableName string
 	client    *dynamodb.DynamoDB
 	watcher   *Watcher
-	done 	  chan struct{}
+	done      chan struct{}
 }
 
 // Register registers dynamodb to libkv
 func Register() {
 	libkv.AddStore(DYNAMODBSTORE, New)
-}
-
-//todo: fix getsession: move to common location for streams to use.
-func getSession() (*session.Session, error) {
-	sess, err := session.NewSession()
-
-	if dynamodbURL := os.Getenv("DYNAMODB_LOCAL"); dynamodbURL != "" {
-		fmt.Println("DYNAMODB_LOCAL is set to %v", dynamodbURL)
-		c := &aws.Config{
-			Endpoint: &dynamodbURL,
-		}
-		//Create a Session with a custom region
-		sess, err = session.NewSession(c)
-	}
-
-	// Fail early, if no credentials can be found
-	_, err = sess.Config.Credentials.Get()
-	return sess, err
 }
 
 //this works
@@ -62,17 +43,17 @@ func New(endpoints []string, options *store.Config) (store.Store, error) {
 		return nil, ErrMultipleEndpointsUnsupported
 	}
 	table := endpoints[0]
-	
+
 	//fmt.Printf("Dynaodb table name %v\n", endpoints[0])
 
-	sess, err := getSession()
+	sess, err := session.Session()
 	if err != nil {
 		return nil, err
 	}
 
 	done := make(chan struct{}, 1)
 	w, err := newWatcher(table, "0", done)
-		if err != nil {
+	if err != nil {
 		return nil, err
 	}
 
@@ -80,7 +61,7 @@ func New(endpoints []string, options *store.Config) (store.Store, error) {
 		tableName: endpoints[0],
 		client:    dynamodb.New(sess),
 		watcher:   w,
-		done : done,
+		done:      done,
 	}
 	return dyna, nil
 }
@@ -151,7 +132,6 @@ func (d *DynamoDB) getPutParams(key string, value []byte) *dynamodb.UpdateItemIn
 func (d *DynamoDB) Put(key string, value []byte, opts *store.WriteOptions) error {
 
 	params := d.getPutParams(key, value)
-	fmt.Printf("Dynamodb.Put : %+v", params)
 	_, err := d.client.UpdateItem(params)
 	return err
 }
@@ -265,10 +245,10 @@ func (d *DynamoDB) WatchTreeEvents(directory string, stopCh <-chan struct{}, las
 	}
 
 	out := make(chan []*store.KVPair, 1000)
-	go func(){
+	go func() {
 		for n := range nn {
-            out <- []*store.KVPair{n}
-        }
+			out <- []*store.KVPair{n}
+		}
 	}()
 	return out, err
 }

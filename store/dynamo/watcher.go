@@ -1,12 +1,12 @@
 package dynamo
 
 import (
-	"fmt"
-	"github.com/docker/libkv/store"
+	//"fmt"
 	"github.com/autodesk-anvil/libkv/store/dynamo/streams"
+	"github.com/docker/libkv/store"
+	"strconv"
 	"strings"
 	"sync"
-	"strconv"
 )
 
 //https://github.com/tjgq/broadcast/blob/master/broadcast.go
@@ -25,11 +25,11 @@ func (wc *watchClient) notify(pair *store.KVPair) {
 }
 
 func (wc *watchClient) isMatch(s string) bool {
-	fmt.Printf("isMatch(%v, %v)", wc.prefix, s)
+	//fmt.Printf("isMatch(%v, %v)", wc.prefix, s)
 	if !wc.isDirectory {
 		return s == wc.prefix
 	} else {
-		return strings.Contains(s, wc.prefix)
+		return strings.HasPrefix(s, wc.prefix)
 	}
 }
 
@@ -37,7 +37,7 @@ func (wc *watchClient) isMatch(s string) bool {
 type Watcher struct {
 	sync.RWMutex
 	clients map[<-chan struct{}]*watchClient
-	stream *streams.StreamClient
+	stream  *streams.StreamClient
 }
 
 func newWatcher(table string, sequenceNumber string, done <-chan struct{}) (*Watcher, error) {
@@ -45,39 +45,42 @@ func newWatcher(table string, sequenceNumber string, done <-chan struct{}) (*Wat
 	if err != nil {
 		return nil, err
 	}
-	w := &Watcher{stream : s, clients: make(map[<-chan struct{}]*watchClient)}
-	
+	w := &Watcher{stream: s, clients: make(map[<-chan struct{}]*watchClient)}
+
 	//monitor stream
 	go func(w *Watcher) {
-		select {
-		case e := <- w.stream.Ch:
-			
-			key := e.Dynamodb.Keys["Key"].S
-			pair := &store.KVPair{
-				Key: *key,
-			}
+		for {
+			select {
+			case e := <-w.stream.Ch:
 
-			item :=  e.Dynamodb.NewImage
-			if len(item) == 0 {
+				key := e.Dynamodb.Keys["Key"].S
+				pair := &store.KVPair{
+					Key: *key,
+				}
+
+				item := e.Dynamodb.NewImage
+				if len(item) == 0 {
+					continue
+				}
+
+				value, exists := item["Value"]
+				if exists {
+					pair.Value = []byte(*value.S)
+				}
+				pair.LastIndex, _ = strconv.ParseUint(*item["Index"].N, 10, 64)
+
+				for _, v := range w.clients {
+					v.notify(pair)
+				}
+
+			case <-done:
+				w.Lock()
+				defer w.Unlock()
+				for k, v := range w.clients {
+					close(v.receiver)
+					delete(w.clients, k)
+				}
 				return
-			}
-
-			value, exists := item["Value"]
-			if exists {
-				pair.Value = []byte(*value.S)
-			}
-			pair.LastIndex, _ = strconv.ParseUint(*item["Index"].N, 10, 64)
-			
-
-			for _, v := range w.clients {
-				v.notify(pair)
-			}
-		case <-done:
-			w.Lock()
-			defer w.Unlock()
-			for k, v := range w.clients {
-				close(v.receiver)
-				delete(w.clients, k)
 			}
 		}
 	}(w)
@@ -89,7 +92,7 @@ func newWatcher(table string, sequenceNumber string, done <-chan struct{}) (*Wat
 func (w *Watcher) addClient(key string, stopCh <-chan struct{}, lastIndex uint64, isDir bool) (<-chan *store.KVPair, error) {
 	//fmt.Printf("Watcher.addClient(%v, %v)", key, stopCh)
 	ch := make(chan *store.KVPair, 10000)
-	
+
 	wc := &watchClient{key, ch, lastIndex, isDir}
 
 	w.Lock()
@@ -97,20 +100,19 @@ func (w *Watcher) addClient(key string, stopCh <-chan struct{}, lastIndex uint64
 	w.Unlock()
 
 	//fmt.Printf("Watch client %v connected", wc)
-	
+
 	//monitor the close channel
 	go w.monitor(stopCh)
 	return ch, nil
 }
 
 func (w *Watcher) removeClient(stopCh <-chan struct{}) {
-	fmt.Printf("Watcher.removeClient(%v, %v)", stopCh)
+	//fmt.Printf("Watcher.removeClient(%v, %v)", stopCh)
 	w.Lock()
 	defer w.Unlock()
 	//close the channel
 	if client, ok := w.clients[stopCh]; ok {
 		delete(w.clients, stopCh)
-		fmt.Printf("Watch client %v disconnected", client)
 		close(client.receiver)
 	}
 }
@@ -122,4 +124,3 @@ func (w *Watcher) monitor(stopCh <-chan struct{}) {
 		w.removeClient(stopCh)
 	}
 }
-
