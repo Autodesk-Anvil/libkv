@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/autodesk-anvil/libkv/store/dynamo/session"
+	"github.com/autodesk-anvil/libkv/store/dynamo/watcher"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/docker/libkv"
@@ -24,8 +25,10 @@ var (
 //  The primary key value of the table should a string named "Key"
 //  The attributes will be called "Index" and "Value"
 type DynamoDB struct {
-	tableName string
-	client    *dynamodb.DynamoDB
+	tableName 		string
+	client    		*dynamodb.DynamoDB
+	streamWatcher   *watcher.Watcher
+	done      		chan struct{}
 }
 
 // Register registers dynamodb to libkv
@@ -46,9 +49,17 @@ func New(endpoints []string, options *store.Config) (store.Store, error) {
 		return nil, err
 	}
 
+	done := make(chan struct{}, 1)
+	w, err := watcher.NewWatcher(endpoints[0], "0", done)
+	if err != nil {
+		return nil, err
+	}
+
 	dyna := &DynamoDB{
 		tableName: endpoints[0],
 		client:    dynamodb.New(sess),
+		streamWatcher:   w,
+		done:      done,
 	}
 	return dyna, nil
 }
@@ -216,12 +227,28 @@ func (d *DynamoDB) DeleteTree(directory string) error {
 func (d *DynamoDB) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error) {
 	// since scans are expensive maybe we should keep all keys being watched in a map
 	// and consolidate our scans of the db into one scan
-	return nil, errors.New("Watch not supported")
+	return d.streamWatcher.AddClient(key, stopCh, 0, false)
 }
 
 // WatchTree has to be implemented at the library since it is not natively supportedby dynamoDB
 func (d *DynamoDB) WatchTree(directory string, stopCh <-chan struct{}) (<-chan []*store.KVPair, error) {
-	return nil, errors.New("WatchTree not supported")
+    //todo: Implement to take a snapshot of a directory, just like it is implemented in etcd store
+	return d.WatchTreeEvents(directory, stopCh, 0)
+}
+
+func (d *DynamoDB) WatchTreeEvents(directory string, stopCh <-chan struct{}, lastIndex uint64) (<-chan []*store.KVPair, error) {
+	nn, err := d.streamWatcher.AddClient(directory, stopCh, lastIndex, true)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan []*store.KVPair, 1000)
+	go func() {
+		for n := range nn {
+			out <- []*store.KVPair{n}
+		}
+	}()
+	return out, err
 }
 
 // Not supported
