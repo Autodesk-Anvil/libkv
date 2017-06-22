@@ -17,11 +17,12 @@ var (
 //Dynamodb stream client wrapper exposes a channel to give out the updates for a given table
 //that occured after specified sequence number.
 type StreamClient struct {
-	client         *dynamodbstreams.DynamoDBStreams
-	table          string
-	streams        []string
-	Ch             chan *dynamodbstreams.Record
-	sequenceNumber *big.Int
+	client           *dynamodbstreams.DynamoDBStreams
+	table            string
+	streams          []string
+	Ch               chan *dynamodbstreams.Record
+	sequenceNumber   *big.Int
+	MaxSquenceNumber *big.Int
 }
 
 // NewDynamoDBStreamClient returns an *dynamodb.Client with a connection to the region
@@ -49,7 +50,7 @@ func NewDynamoDBStreamClient(table string, sequenceNumber string, done <-chan st
 		return nil, err
 	}
 
-	c := &StreamClient{client, table, streams, make(chan *dynamodbstreams.Record, 100000), sn}
+	c := &StreamClient{client, table, streams, make(chan *dynamodbstreams.Record, 100000), sn, new(big.Int)}
 
 	//start pulling from the stream
 	c.processStreams(done)
@@ -93,6 +94,13 @@ func (c *StreamClient) processStream(stream string, done <-chan struct{}) {
 	}()
 }
 
+//set the Max sequence number found so far
+func (c *StreamClient) setMaxSequenceNumber(sn *big.Int) {
+	if sn.Cmp(c.MaxSquenceNumber) != -1 {
+		c.MaxSquenceNumber = sn
+	}
+}
+
 func (c *StreamClient) processShard(shard *dynamodbstreams.Shard, stream string, done <-chan struct{}) {
 
 	shardName := *shard.ShardId
@@ -103,9 +111,12 @@ func (c *StreamClient) processShard(shard *dynamodbstreams.Shard, stream string,
 
 	maxSequenceNumber, err2 := toBigInt(shard.SequenceNumberRange.EndingSequenceNumber)
 	if err2 == nil {
+
 		if c.sequenceNumber.Cmp(maxSequenceNumber) == 1 {
 			//these events are too old
 			return
+		} else {
+			c.setMaxSequenceNumber(maxSequenceNumber)
 		}
 	}
 
@@ -139,10 +150,13 @@ func (c *StreamClient) processShard(shard *dynamodbstreams.Shard, stream string,
 			sn, err := toBigInt(v.Dynamodb.SequenceNumber)
 
 			//condition: the record sequence number sn is not less than c.sequenceNumber
-			if err == nil && sn.Cmp(c.sequenceNumber) != -1 {
-				//log.Printf("processShard event(%v)", *v.Dynamodb.Keys["Key"].S)
-				c.Ch <- v
+			if err == nil {
+				if sn.Cmp(c.sequenceNumber) != -1 {
+					c.Ch <- v
+				}
+				c.setMaxSequenceNumber(sn)
 			}
+
 		}
 
 		select {

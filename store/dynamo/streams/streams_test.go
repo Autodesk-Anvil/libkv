@@ -11,6 +11,7 @@ var (
 	FlagTable          = flag.String("table", "traefik", "Dynamodb table name")
 	FlagSequenceNumber = flag.String("sequencenumber", "00000000000000000000000001", "Dynamodb table sequence number to stream after")
 )
+
 //todo: add assertions etc.
 func TestStream(t *testing.T) {
 	done := make(chan struct{}, 0)
