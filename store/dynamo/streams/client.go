@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodbstreams"
 	"log"
 	"math/big"
+	"time"
 )
 
 var (
@@ -17,19 +18,20 @@ var (
 //Dynamodb stream client wrapper exposes a channel to give out the updates for a given table
 //that occured after specified sequence number.
 type StreamClient struct {
-	client           *dynamodbstreams.DynamoDBStreams
-	table            string
-	streams          []string
-	Ch               chan *dynamodbstreams.Record
-	sequenceNumber   *big.Int
+	client         *dynamodbstreams.DynamoDBStreams
+	table          string
+	streams        []string
+	Ch             chan *dynamodbstreams.Record
+	sequenceNumber *big.Int
+	//timestamp		 *time.Time
 	MaxSquenceNumber *big.Int
 }
 
 // NewDynamoDBStreamClient returns an *dynamodb.Client with a connection to the region
 // configured via the AWS_REGION environment variable.
 // It returns an error if the connection cannot be made or the table does not exist.
-func NewDynamoDBStreamClient(table string, sequenceNumber string, done <-chan struct{}) (*StreamClient, error) {
-
+func NewDynamoDBStreamClient(table string, sequenceNumber string /*timestamp *time.Time,*/, done <-chan struct{}) (*StreamClient, error) {
+	log.Printf("NewDynamoDBStreamClient(%v, %v)", table, sequenceNumber)
 	//create a dynamodb client
 	sess, err := session.Session()
 	if err != nil {
@@ -44,10 +46,15 @@ func NewDynamoDBStreamClient(table string, sequenceNumber string, done <-chan st
 		return nil, ErrNoStreamFound
 	}
 
-	sn, err := toBigInt(&sequenceNumber)
-	if err != nil {
-		log.Printf("bad sequence number(%v) error %v", sequenceNumber, err)
-		return nil, err
+	var sn *big.Int
+	log.Printf("\nNewDynamoDBStreamClient.sequenceNumber(%v is %v long)\n", sequenceNumber, len(sequenceNumber))
+
+	if len(sequenceNumber) != 0 {
+		sn, err = toBigInt(&sequenceNumber)
+		if err != nil {
+			log.Printf("bad sequence number(%v) error %v", sequenceNumber, err)
+			return nil, err
+		}
 	}
 
 	c := &StreamClient{client, table, streams, make(chan *dynamodbstreams.Record, 100000), sn, new(big.Int)}
@@ -107,67 +114,94 @@ func (c *StreamClient) processShard(shard *dynamodbstreams.Shard, stream string,
 	if len(shardName) > 10 {
 		shardName = shardName[len(shardName)-3:]
 	}
-	//log.Printf("processShard start(%v)\n", shardName)
-
-	maxSequenceNumber, err2 := toBigInt(shard.SequenceNumberRange.EndingSequenceNumber)
-	if err2 == nil {
-
-		if c.sequenceNumber.Cmp(maxSequenceNumber) == 1 {
-			//these events are too old
-			return
-		} else {
-			c.setMaxSequenceNumber(maxSequenceNumber)
-		}
-	}
 
 	getShardIteratorInput := &dynamodbstreams.GetShardIteratorInput{
-		ShardId:           aws.String(*shard.ShardId),                                    // Required
-		ShardIteratorType: aws.String(dynamodbstreams.ShardIteratorTypeAtSequenceNumber), //aws.String(dynamodbstreams.ShardIteratorTypeAfterSequenceNumber), // Required
-		SequenceNumber:    shard.SequenceNumberRange.StartingSequenceNumber,
-		StreamArn:         aws.String(stream), // Required
+		ShardId:   aws.String(*shard.ShardId), // Required
+		StreamArn: aws.String(stream),         // Required
 	}
 
-	getShardIteratorInputResp, err := c.client.GetShardIterator(getShardIteratorInput)
-	if err != nil {
-		//fmt.Printf("\nerror processing(%v): err: %v\n", shardName, err.Error())
-		return
+	if c.sequenceNumber != nil {
+		maxSequenceNumber, err2 := toBigInt(shard.SequenceNumberRange.EndingSequenceNumber)
+		if err2 == nil {
+			if c.sequenceNumber.Cmp(maxSequenceNumber) == 1 {
+				//these events are too old
+				return
+			} else {
+				c.setMaxSequenceNumber(maxSequenceNumber)
+			}
+		}
+
+		fmt.Println("using StartingSequenceNumber")
+		getShardIteratorInput.ShardIteratorType = aws.String(dynamodbstreams.ShardIteratorTypeAfterSequenceNumber) 
+		getShardIteratorInput.SequenceNumber = shard.SequenceNumberRange.StartingSequenceNumber
+
+	} else {
+		if shard.SequenceNumberRange.EndingSequenceNumber != nil {
+			fmt.Println("shard already closed...returning")
+			return
+		}
+		fmt.Println("using latest")
+		getShardIteratorInput.ShardIteratorType = aws.String(dynamodbstreams.ShardIteratorTypeLatest)
 	}
-	iter := getShardIteratorInputResp.ShardIterator
+	log.Printf("processShard start(%+v)\n", shard)
+	log.Printf("input(%+v)\n", getShardIteratorInput)
 
-	for iter != nil {
-
-		//get records
-		getRecordsInput := &dynamodbstreams.GetRecordsInput{
-			ShardIterator: aws.String(*iter), // Required
+	for {
+		getShardIteratorInputResp, err := c.client.GetShardIterator(getShardIteratorInput)
+		if err != nil || getShardIteratorInputResp == nil {
+			log.Printf("\nerror processing(%v): err: %v\n", shardName, err.Error())
+			return
 		}
-		getRecordsInputResp, err := c.client.GetRecords(getRecordsInput)
-		if err != nil {
-			//fmt.Printf("\nerror processing(%v) records : err: %v\n", shardName, err.Error())
-			break
-		}
+		initIter := getShardIteratorInputResp.ShardIterator
+		iter := initIter
+		log.Printf("got first iterator (%v)", iter)
+		for iter != nil {
+			//log.Printf("working on iterator(%v)", iter)
+			//get records
+			getRecordsInput := &dynamodbstreams.GetRecordsInput{
+				ShardIterator: aws.String(*iter), // Required
+			}
+			//log.Printf("getRecordsInput(%v)", getRecordsInput)
+			getRecordsInputResp, err := c.client.GetRecords(getRecordsInput)
 
-		for _, v := range getRecordsInputResp.Records {
-			sn, err := toBigInt(v.Dynamodb.SequenceNumber)
-
-			//condition: the record sequence number sn is not less than c.sequenceNumber
-			if err == nil {
-				if sn.Cmp(c.sequenceNumber) != -1 {
-					c.Ch <- v
-				}
-				c.setMaxSequenceNumber(sn)
+			if err != nil {
+				log.Printf("\nerror processing(%v) records : err: %v\n", shardName, err.Error())
+				//todo: this happens in case of empty stream (new table or 24 hour non-updates). todo introduce bakcoff
+				//todo(sabder): make sure when we break and repeat over this shard, we don't collect records already collected.
+				//idealy that should be the case.
+				<-time.After(2 * time.Second)
+				break
 			}
 
-		}
+			for _, v := range getRecordsInputResp.Records {
+				//log.Printf("gshard(%v)-> record(%v)", shardName, v)
 
-		select {
-		case <-done:
-			//fmt.Printf("\nprocessShard canceled(%v)\n", shardName)
-			return
-		default:
+				sn, err := toBigInt(v.Dynamodb.SequenceNumber)
+				log.Printf("got record sequenceNumber(%+v)", sn)
+
+				//condition: the record sequence number sn is not less than c.sequenceNumber
+				if err == nil {
+					//todo: we are dropping the records here. investigate
+					if c.sequenceNumber == nil || sn.Cmp(c.sequenceNumber) != -1 {
+						log.Printf("sending the record with sn(%+v)", sn)
+						c.Ch <- v
+					}
+					c.setMaxSequenceNumber(sn)
+				}
+
+			}
+
+			select {
+			case <-done:
+				log.Printf("\nprocessShard canceled(%v)\n", shardName)
+				return
+			default:
+			}
+			iter = getRecordsInputResp.NextShardIterator
+			//log.Printf("got next iterator (%v)", iter)
 		}
-		iter = getRecordsInputResp.NextShardIterator
 	}
-	//log.Printf("processShard done(%v)\n", shardName)
+	log.Printf("processShard done(%v)\n", shardName)
 }
 
 //Select the streams for given table

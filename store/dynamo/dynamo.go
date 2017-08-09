@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/docker/libkv"
 	"github.com/docker/libkv/store"
+	"log"
 	"strconv"
 	"strings"
 )
@@ -25,10 +26,10 @@ var (
 //  The primary key value of the table should a string named "Key"
 //  The attributes will be called "Index" and "Value"
 type DynamoDB struct {
-	tableName 		string
-	client    		*dynamodb.DynamoDB
-	streamWatcher   *watcher.Watcher
-	done      		chan struct{}
+	tableName     string
+	client        *dynamodb.DynamoDB
+	streamWatcher *watcher.Watcher
+	done          chan struct{}
 }
 
 // Register registers dynamodb to libkv
@@ -38,11 +39,11 @@ func Register() {
 
 // New create a new connection to dynamodb then table named endpoint
 func New(endpoints []string, options *store.Config) (store.Store, error) {
-	if len(endpoints) > 1 {
+	if len(endpoints) > 2 {
 		return nil, ErrMultipleEndpointsUnsupported
 	}
 
-	//fmt.Printf("Dynaodb table name %v\n", endpoints[0])
+	//log.Printf("Dynaodb table name %v\n", endpoints[0])
 
 	sess, err := session.Session()
 	if err != nil {
@@ -50,16 +51,24 @@ func New(endpoints []string, options *store.Config) (store.Store, error) {
 	}
 
 	done := make(chan struct{}, 1)
-	w, err := watcher.NewWatcher(endpoints[0], "0", done)
+
+	//SEQUENCENUMBER or LATEST
+	var index string
+	if len(endpoints) == 2 {
+		index = endpoints[1]
+	}
+
+	log.Println("creating a watcher")
+	w, err := watcher.NewWatcher(endpoints[0], index, done)
 	if err != nil {
 		return nil, err
 	}
 
 	dyna := &DynamoDB{
-		tableName: endpoints[0],
-		client:    dynamodb.New(sess),
-		streamWatcher:   w,
-		done:      done,
+		tableName:     endpoints[0],
+		client:        dynamodb.New(sess),
+		streamWatcher: w,
+		done:          done,
 	}
 	return dyna, nil
 }
@@ -232,11 +241,12 @@ func (d *DynamoDB) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPa
 
 // WatchTree has to be implemented at the library since it is not natively supportedby dynamoDB
 func (d *DynamoDB) WatchTree(directory string, stopCh <-chan struct{}) (<-chan []*store.KVPair, error) {
-    //todo: Implement to take a snapshot of a directory, just like it is implemented in etcd store
+	//todo: Implement to take a snapshot of a directory, just like it is implemented in etcd store
 	return d.WatchTreeEvents(directory, stopCh, 0)
 }
 
 func (d *DynamoDB) WatchTreeEvents(directory string, stopCh <-chan struct{}, lastIndex uint64) (<-chan []*store.KVPair, error) {
+	log.Println("dynamodb.WatchTreeEvents")
 	nn, err := d.streamWatcher.AddClient(directory, stopCh, lastIndex, true)
 	if err != nil {
 		return nil, err

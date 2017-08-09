@@ -10,7 +10,7 @@ func TestPutGetDeleteExistsStream(t *testing.T) {
 	kv := makeDynamoClient(t)
 	stopch := make(chan struct{})
 	ch, _ := kv.Watch("testPutGetDeleteExists", stopch)
-	loop:
+loop:
 	for {
 		select {
 		case a := <-ch:
@@ -22,7 +22,7 @@ func TestPutGetDeleteExistsStream(t *testing.T) {
 	}
 }
 
-func TestWatchTreeRoot(t *testing.T) {
+func TestWatchTreeRootLatest(t *testing.T) {
 	kv := makeDynamoClient(t)
 	done := make(chan struct{}, 1)
 	key := ""
@@ -40,7 +40,30 @@ func TestWatchTreeRoot(t *testing.T) {
 			return
 		}
 	}()
-	<-time.After(time.Second * 15)
+	<-time.After(time.Second * 25)
+	close(done)
+	<-time.After(time.Second)
+}
+
+func TestWatchTreeRootFromStart(t *testing.T) {
+	kv := makeDynamoClientFromStart(t)
+	done := make(chan struct{}, 1)
+	key := ""
+	ch, err := kv.WatchTree(key, done)
+	if err != nil {
+		t.Fatalf("streams failed %v", err)
+	}
+	go func() {
+		select {
+		case vv := <-ch:
+			for v := range vv {
+				log.Printf("v:%v", v)
+			}
+		case <-done:
+			return
+		}
+	}()
+	<-time.After(time.Second * 25)
 	close(done)
 	<-time.After(time.Second)
 }

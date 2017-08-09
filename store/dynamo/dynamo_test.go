@@ -10,6 +10,21 @@ import (
 
 var client = "traefik"
 
+func makeDynamoClientFromStart(t *testing.T) store.Store {
+	kv, err := New(
+		[]string{client, "0"},
+		&store.Config{
+			Bucket: "us-east-1",
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("cannot create store: %v", err)
+	}
+
+	return kv
+}
+
 func makeDynamoClient(t *testing.T) store.Store {
 	kv, err := New(
 		[]string{client},

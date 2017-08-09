@@ -13,7 +13,7 @@ var (
 )
 
 //todo: add assertions etc.
-func TestStream(t *testing.T) {
+func TestStreamWithSequenceNumber(t *testing.T) {
 	done := make(chan struct{}, 0)
 	flag.Parse()
 	client, err := NewDynamoDBStreamClient(*FlagTable, *FlagSequenceNumber, done)
@@ -27,6 +27,31 @@ loop:
 		case a := <-client.Ch:
 			log.Printf("event(%v Type %T)", a, a)
 		case <-time.After(time.Second * 6):
+			log.Printf("closing done")
+			close(done)
+			break loop
+		}
+	}
+	//close the done channel after some time
+	<-time.After(time.Second * 10)
+	log.Printf("finished testing")
+}
+
+//todo: add assertions etc.
+func TestStreamWithLatest(t *testing.T) {
+	done := make(chan struct{}, 0)
+	flag.Parse()
+	client, err := NewDynamoDBStreamClient(*FlagTable, "", done)
+	if err != nil {
+		t.Fatalf("failed")
+	}
+
+loop:
+	for {
+		select {
+		case a := <-client.Ch:
+			log.Printf("event(%v Type %T)", a, a)
+		case <-time.After(time.Second * 20):
 			log.Printf("closing done")
 			close(done)
 			break loop

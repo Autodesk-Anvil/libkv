@@ -3,6 +3,7 @@ package watcher
 import (
 	"github.com/autodesk-anvil/libkv/store/dynamo/streams"
 	"github.com/docker/libkv/store"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,12 +19,15 @@ type watchClient struct {
 
 func (wc *watchClient) notify(pair *store.KVPair) {
 	if wc.isMatch(pair.Key) {
+		log.Printf("watchClient.notify %v", pair)
 		wc.receiver <- pair
+	} else {
+		log.Printf("watchClient.notify key(%v) did not match record(%v)", pair.Key)
 	}
 }
 
 func (wc *watchClient) isMatch(s string) bool {
-	//fmt.Printf("isMatch(%v, %v)", wc.prefix, s)
+	log.Printf("isMatch(%v, %v)", wc.prefix, s)
 	if !wc.isDirectory {
 		return s == wc.prefix
 	} else {
@@ -39,6 +43,7 @@ type Watcher struct {
 }
 
 func NewWatcher(table string, sequenceNumber string, done <-chan struct{}) (*Watcher, error) {
+	log.Printf("creating NewDynamoDBStreamClient(%v)", sequenceNumber)
 	s, err := streams.NewDynamoDBStreamClient(table, sequenceNumber, done)
 	if err != nil {
 		return nil, err
@@ -47,30 +52,40 @@ func NewWatcher(table string, sequenceNumber string, done <-chan struct{}) (*Wat
 
 	//monitor stream
 	go func(w *Watcher) {
+		log.Println("Watcher loop started...")
 		for {
+			log.Println("Water loop waiting on next event")
 			select {
 			case e := <-w.stream.Ch:
+				log.Printf("watcher got record(%+v)", e)
 				if e == nil || e.Dynamodb == nil || e.Dynamodb.Keys == nil {
 					continue
 				}
+
 				key := e.Dynamodb.Keys["Key"].S
 				pair := &store.KVPair{
 					Key: *key,
 				}
 
-				if e.Dynamodb.NewImage == nil || len(e.Dynamodb.NewImage) == 0 {
-					continue
-				}
+				//this is a delete notification
+				if e.Dynamodb.NewImage != nil && len(e.Dynamodb.NewImage) != 0 {
+					log.Printf("watcher got add record(%+v)", pair.Key)
+					item := e.Dynamodb.NewImage
 
-				item := e.Dynamodb.NewImage
+					value, exists := item["Value"]
 
-				value, exists := item["Value"]
-				if exists {
-					pair.Value = []byte(*value.S)
+					if exists {
+						pair.Value = []byte(*value.S)
+						if item["Index"] != nil && item["Index"].N != nil {
+							pair.LastIndex, _ = strconv.ParseUint(*item["Index"].N, 10, 64)
+						}
+					}
+				} else {
+					log.Printf("watcher got delete record(%+v)", pair.Key)
 				}
-				pair.LastIndex, _ = strconv.ParseUint(*item["Index"].N, 10, 64)
 
 				for _, v := range w.clients {
+					log.Printf("watcher sending record(%+v)", pair.Key)
 					v.notify(pair)
 				}
 
